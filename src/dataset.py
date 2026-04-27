@@ -203,80 +203,66 @@ def load_dataset(path: str) -> list:
 # 5. REWARD VALIDATION — RUN THIS BEFORE TRAINING
 # ---------------------------------------------------------------------------
 
-def validate_reward(model, tokenizer, n_samples: int = 20, device: str = "cpu"):
+def validate_reward(model, tokenizer, n_samples=20, device="cuda"):
     """
-    Sanity check: what fraction of BASE MODEL outputs get non-zero reward?
+    Fixed version — uses same generation settings as actual GRPO rollouts.
 
-    Target: 5% – 40%
-    - Below 5%: reward function too strict OR task too hard
-              → model gets zero gradient → nothing to learn
-    - Above 50%: task too easy, model already knows it
-               → not enough room to improve
-
-    ALWAYS run this before starting training. Fix the reward function
-    before writing the training loop.
+    Key fix: tests G=4 completions per problem and checks WITHIN-GROUP std,
+    not just raw hit rate. That's the metric GRPO actually cares about.
     """
-    import torch
+    import torch, statistics
 
-    problems = generate_dataset(n_samples, seed=777)
-    rewards = []
-    results = []
+    problems  = generate_dataset(n_samples, seed=777)
+    group_stds, correct_rates = [], []
 
     model.eval()
     for a, b, answer in problems:
-        prompt = format_prompt(a, b)
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        prompt  = format_prompt(a, b)
+        inputs  = tokenizer(prompt, return_tensors="pt").to(device)
+        group   = []
 
-        with torch.no_grad():
-            output = model.generate(
-                **inputs,
-                max_new_tokens=150,
-                do_sample=True,
-                temperature=0.8,
-                pad_token_id=tokenizer.eos_token_id
+        for _ in range(4):   # mini rollout
+            with torch.no_grad():
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=200,
+                    do_sample=True,
+                    temperature=0.8,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            text = tokenizer.decode(
+                out[0][inputs['input_ids'].shape[1]:],
+                skip_special_tokens=True
             )
+            group.append(reward_function(text, answer))
 
-        # Decode only the new tokens
-        completion = tokenizer.decode(
-            output[0][inputs['input_ids'].shape[1]:],
-            skip_special_tokens=True
-        )
+        group_stds.append(statistics.stdev(group) if len(group) > 1 else 0)
+        correct_rates.append(sum(1 for r in group if r >= 1.0) / len(group))
 
-        r = reward_function(completion, answer)
-        rewards.append(r)
-        results.append({
-            "problem": f"{a} × {b} = {answer}",
-            "completion_preview": completion[:100],
-            "reward": r,
-            "has_think": has_think_tags(completion),
-            "extracted_answer": extract_answer(completion)
-        })
-
-    # Summary stats
-    hit_rate = sum(1 for r in rewards if r > 0) / len(rewards)
-    correct_rate = sum(1 for r in rewards if r >= 1.0) / len(rewards)
-    format_rate = sum(1 for res in results if res["has_think"]) / len(results)
+    avg_std      = statistics.mean(group_stds)
+    correct_rate = statistics.mean(correct_rates)
+    skip_rate    = sum(1 for s in group_stds if s < 0.01) / len(group_stds)
 
     print("\n" + "="*50)
-    print("REWARD VALIDATION RESULTS")
+    print("REWARD VALIDATION (fixed — group-based)")
     print("="*50)
-    print(f"Non-zero reward rate: {hit_rate:.1%}  (target: 5-40%)")
-    print(f"Correct answer rate:  {correct_rate:.1%}")
-    print(f"Format compliance:    {format_rate:.1%}  (uses <think> tags)")
-    print()
+    print(f"Avg within-group std: {avg_std:.3f}  (target: > 0.15)")
+    print(f"Avg correct rate:     {correct_rate:.1%}  (needs to be > 0%)")
+    print(f"Steps GRPO skips:     {skip_rate:.0%}   (target: < 20%)")
 
-    if hit_rate < 0.05:
-        print("⚠️  WARNING: Too few non-zero rewards. Fix reward function or simplify task.")
-    elif hit_rate > 0.5:
-        print("⚠️  WARNING: Too many non-zero rewards. Task may be too easy.")
-    else:
-        print("✓  Reward function looks healthy. Proceed to training.")
+    if avg_std > 0.15 and correct_rate > 0 and skip_rate < 0.2:
+        print("\n✓ Healthy — GRPO will learn from this task")
+    elif correct_rate == 0:
+        print("\n✗ Correct rate = 0% — model never gets answers right")
+        print("  Fix: check <answer> tags are in prompt example")
+    elif avg_std < 0.05:
+        print("\n✗ Std too low — model is too consistent (all right or all wrong)")
+        print("  Fix: raise temperature or pick harder task")
+    elif skip_rate > 0.5:
+        print("\n✗ GRPO skipping too many steps — not enough group variance")
 
-    print("\nExample outputs:")
-    for res in results[:3]:
-        print(f"  {res['problem']} | reward={res['reward']} | preview: {res['completion_preview'][:60]}...")
+    return avg_std, correct_rate
 
-    return hit_rate, results
 
 
 # ---------------------------------------------------------------------------
