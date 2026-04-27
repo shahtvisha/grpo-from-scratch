@@ -1,7 +1,7 @@
 """
 experiments/run_trl.py — Run GRPO training using HuggingFace TRL
 
-Points to check if this script fails:
+incase of failure:
   - Check reward validation output — hit rate must be 5-40%
   - Check VRAM — Qwen2.5-1.5B needs ~3GB in float16
   - Check TRL version — needs >= 0.8.6 for GRPOTrainer
@@ -56,18 +56,34 @@ def parse_args():
 # TRL REWARD WRAPPER
 # ---------------------------------------------------------------------------
 
+def _extract_completion_text(completion) -> str:
+    """
+    Normalise a TRL completion to plain text.
+
+    TRL's completion format changed across versions:
+      Old (<0.9):  completions is list[str]
+      New (>=0.9): completions is list[list[dict]] chat message format
+                   e.g. [[{"role": "assistant", "content": "..."}]]
+    """
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, list) and len(completion) > 0:
+        msg = completion[-1]
+        if isinstance(msg, dict):
+            return msg.get("content", "")
+    return str(completion)
+
+
 def make_trl_reward_fn(eval_problems):
     """
-    TRL's GRPOTrainer expects reward functions with this signature:
-        fn(completions: list[str], **kwargs) -> list[float]
-
+    Build a TRL-compatible reward function.
+    Signature: fn(completions, answer, **kwargs) -> list[float]
     The 'answer' kwarg comes from the dataset column named 'answer'.
-    We wrap our reward_function to match this interface.
     """
     def trl_reward(completions, answer, **kwargs):
         return [
-            reward_function(completion, int(ans))
-            for completion, ans in zip(completions, answer)
+            reward_function(_extract_completion_text(c), int(ans))
+            for c, ans in zip(completions, answer)
         ]
     return trl_reward
 
@@ -153,22 +169,40 @@ def main():
     trl_reward_fn = make_trl_reward_fn(eval_problems)
 
     # ── 8. TRL GRPOConfig ─────────────────────────────────────────────────
-    trl_config = TRLGRPOConfig(
+    # Parameter names changed across TRL versions:
+    #   max_new_tokens      → max_completion_length   (breaking change ~0.9+)
+    #   num_generations     → num_generations          (stable)
+    #   beta                → beta                     (stable)
+    # We detect the installed version and use the right names automatically.
+    import trl as _trl
+    from packaging.version import Version as V
+
+    trl_version = V(_trl.__version__)
+    use_new_api = trl_version >= V("0.9.0")
+
+    print(f"  TRL version: {_trl.__version__} → using {'new' if use_new_api else 'old'} API")
+
+    common_kwargs = dict(
         output_dir=f"{args.output}/trl_checkpoints",
-        num_train_epochs=1,
         max_steps=args.steps,
         per_device_train_batch_size=2,
-        gradient_accumulation_steps=2,          # effective batch = 4
+        gradient_accumulation_steps=2,          # effective batch size = 4
         learning_rate=args.lr,
-        num_generations=args.G,
-        max_new_tokens=256,
+        num_generations=args.G,                 # completions per prompt (was G)
         temperature=0.8,
-        beta=0.1,                               # KL penalty
+        beta=0.1,                               # KL penalty weight
         logging_steps=10,
         save_steps=100,
-        report_to="none",                       # change to "wandb" if using wandb
-        remove_unused_columns=False,            # keep 'answer' column for reward fn
+        report_to="none",                       # swap to "wandb" if you want curves
+        remove_unused_columns=False,            # keeps 'answer' col for reward fn
     )
+
+    if use_new_api:
+        common_kwargs["max_completion_length"] = 256   # TRL >= 0.9
+    else:
+        common_kwargs["max_new_tokens"] = 256          # TRL < 0.9
+
+    trl_config = TRLGRPOConfig(**common_kwargs)
 
     # ── 9. Train ──────────────────────────────────────────────────────────
     print("\n" + "─" * 60)
