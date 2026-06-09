@@ -2,8 +2,8 @@
 
 ## Hypothesis
 Can a small LLM learn multi-step arithmetic reasoning through 
-pure reinforcement learning — with no labeled reasoning traces, 
-no human feedback, no chain-of-thought supervision?
+pure reinforcement learning, no labeled reasoning traces, 
+no human feedback and no chain-of-thought supervision?
 
 ## Method
 - Model: Qwen2.5-1.5B-Instruct
@@ -11,12 +11,6 @@ no human feedback, no chain-of-thought supervision?
 - Algorithm: GRPO (Group Relative Policy Optimization)
 - Reward: Binary verifiable (correct answer = 1.0, wrong = 0.0)
 - Ablation: Same setup, reward signal removed
-
-## Results
-
-
-
-
 
 ## Based On
 - DeepSeek-R1-Zero (DeepSeek-AI, 2025)
